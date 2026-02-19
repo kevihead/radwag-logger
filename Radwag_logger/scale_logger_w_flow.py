@@ -248,10 +248,12 @@ class ScaleFlowLogger:
         self.graph_start_time = None
         
         # Flow log/plot rates
-        self.flow_log_hz = 100.0
+        self.flow_log_hz = 10.0
         self.flow_plot_hz = 10.0
 
         # Internals
+        self.last_scale_reading = None
+        self.last_scale_stability = None
         self.flow_output_hz = self.flow_log_hz  # kept for backward-compat; used by flow_bin_seconds
         self.flow_bin_seconds = 1.0 / self.flow_output_hz
 
@@ -372,14 +374,11 @@ class ScaleFlowLogger:
         scale_status_label = ttk.Label(settings_frame, textvariable=self.scale_status_var, font=('Arial', 9, 'bold'))
         scale_status_label.grid(row=0, column=4, sticky=tk.W, padx=(10, 0))
         
-        # Flow sensor status
-        ttk.Label(settings_frame, text="Flow:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
-        ttk.Label(settings_frame, text="Control Center").grid(row=1, column=1, columnspan=2, sticky=tk.W, pady=(5, 0))
-        
-        self.flow_status_var = tk.StringVar(value="Flow: Control Center Not Running")
+        # Flow status (single label, like before)
+        self.flow_status_var = tk.StringVar(value="Flow: Not measuring")
         flow_status_label = ttk.Label(settings_frame, textvariable=self.flow_status_var, font=('Arial', 9, 'bold'))
-        flow_status_label.grid(row=1, column=4, sticky=tk.W, padx=(10, 0), pady=(5, 0))
-        
+        flow_status_label.grid(row=1, column=0, columnspan=5, sticky=tk.W, padx=(0, 5), pady=(5, 0))
+
         # Flow log folder selection row
         ttk.Label(settings_frame, text="Flow Logs Folder:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
         ttk.Entry(settings_frame, textvariable=self.flow_log_dir_var).grid(row=2, column=1, columnspan=3, sticky=(tk.W, tk.E), pady=(5, 0))
@@ -388,19 +387,19 @@ class ScaleFlowLogger:
 
         # Control buttons
         button_frame = ttk.Frame(left_frame)
-        button_frame.grid(row=1, column=0, pady=(0, 10))
-        
+        button_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
         self.connect_scale_btn = ttk.Button(button_frame, text="Connect Scale", command=self.connect_scale)
-        self.connect_scale_btn.pack(side=tk.LEFT, padx=(0, 5))
-        
+        self.connect_scale_btn.pack(side=tk.LEFT, padx=(0, 5), anchor='w')
+
         self.start_btn = ttk.Button(button_frame, text="Start Logging", command=self.start_logging)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 5))
-        
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 5), anchor='w')
+
         self.stop_btn = ttk.Button(button_frame, text="Stop Logging", command=self.stop_logging, state='disabled')
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 5))
-        
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 5), anchor='w')
+
         self.reset_btn = ttk.Button(button_frame, text="Reset", command=self.reset_logging)
-        self.reset_btn.pack(side=tk.LEFT)
+        self.reset_btn.pack(side=tk.LEFT, anchor='w')
         
         # Data display
         data_frame = ttk.LabelFrame(left_frame, text="Live Data", padding="5")
@@ -496,13 +495,49 @@ class ScaleFlowLogger:
         # Start animation
         self.ani = FuncAnimation(self.fig, self.update_graph, interval=200, blit=False, cache_frame_data=False)
     
+    def parse_scale_data(self, raw_data):
+        """Parse the scale data to extract stability and reading"""
+        try:
+            # Example: "SI ?       0.00 g" or "SI ? -     0.02 g"
+            # Remove "SI" and extra spaces
+            data = raw_data.strip()
+            
+            # Check if stable (no ?) or unstable (has ?)
+            stable = 0 if '?' in data else 1
+            
+            # Extract the numeric value
+            # Remove SI, ?, and g, then clean up spaces
+            cleaned = data.replace('SI', '').replace('?', '').replace('g', '').strip()
+            
+            # Handle the minus sign that might be separated
+            if '-' in cleaned:
+                # Find the minus and the number
+                parts = cleaned.split()
+                reading = -float([p for p in parts if p.replace('.', '').replace('-', '').isdigit()][-1])
+            else:
+                # Extract just the number
+                parts = cleaned.split()
+                reading = float([p for p in parts if p.replace('.', '').isdigit()][-1])
+                
+            return stable, reading
+            
+        except (ValueError, IndexError) as e:
+            return None, None
+
     def connect_scale(self):
         """Connect to Radwag scale"""
         try:
             port = self.scale_com_port_var.get()
             baud = int(self.scale_baud_rate_var.get())
             
-            self.scale_serial_connection = serial.Serial(port, baud, timeout=1)
+            self.scale_serial_connection = serial.Serial(
+                port=port,
+                baudrate=baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1
+            )
             time.sleep(0.5)
             
             self.scale_status_var.set(f"Scale: Connected ({port})")
@@ -654,10 +689,11 @@ class ScaleFlowLogger:
         while not self.stop_reading:
             try:
                 if self.scale_serial_connection and self.scale_serial_connection.is_open:
-                    line = self.scale_serial_connection.readline().decode('utf-8', errors='ignore').strip()
-                    
-                    if line:
-                        self.scale_data_queue.put(line)
+                    if self.scale_serial_connection.in_waiting > 0:
+                        line = self.scale_serial_connection.readline().decode('utf-8', errors='ignore').strip()
+                        
+                        if line:
+                            self.scale_data_queue.put(line)
             except Exception as e:
                 pass
             
@@ -762,8 +798,8 @@ class ScaleFlowLogger:
                         timestamp_dt = datetime.datetime.fromtimestamp(bin_epoch)
                         unix_s = f"{bin_epoch:.3f}"
                         elapsed = bin_epoch - (self._logging_start_epoch or bin_epoch)
-                        weight = 0.0
-                        stability = 'N/A'
+                        weight = self.last_scale_reading if self.last_scale_reading is not None else 0.0
+                        stability = self.last_scale_stability if self.last_scale_stability is not None else 'N/A'
 
                         self.csv_writer.writerow([
                             timestamp_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
@@ -792,7 +828,7 @@ class ScaleFlowLogger:
                     if self._flow_logged_bins_since_plot >= self._flow_plot_every_n:
                         plot_s = bin_epoch - (self._flow_epoch_zero or bin_epoch)
                         self.graph_timestamps.append(plot_s)
-                        self.graph_scale_readings.append(0.0)
+                        self.graph_scale_readings.append(self.last_scale_reading if self.last_scale_reading is not None else 0.0)
                         self.graph_flow_readings.append(avg_flow)
                         self._flow_logged_bins_since_plot = 0
 
@@ -826,52 +862,15 @@ class ScaleFlowLogger:
             self.root.after(50, self.check_data_queue)
     
     def process_scale_data(self, line):
-        """Process scale reading"""
-        try:
-            # Parse scale data (format: weight, stability, unit)
-            parts = line.split()
-            
-            if len(parts) >= 2:
-                weight_str = parts[0].replace(',', '.')
-                weight = float(weight_str)
-                stability = parts[1] if len(parts) > 1 else 'ST'
-                
-                self.current_scale_reading_var.set(f"{weight:.3f} g ({stability})")
-                
-                # If logging, write to file
-                if self.is_logging and self.csv_writer:
-                    timestamp = datetime.datetime.now()
-                    unix_s = f"{timestamp.timestamp():.3f}"
-                    elapsed = (timestamp - self.start_time).total_seconds()
+        """Process scale reading, update UI, and store latest value."""
+        stable, reading = self.parse_scale_data(line)
 
-                    flow_value = self.flow_reader.last_flow_value if self.flow_reader.last_flow_value else 0.0
-                    pressure_value = self.flow_reader.last_pressure_value if self.flow_reader.last_pressure_value else 0.0
-                    temperature_value = self.flow_reader.last_temperature_value if self.flow_reader.last_temperature_value else 0.0
-
-                    self.csv_writer.writerow([
-                        timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                        unix_s,
-                        f"{elapsed:.3f}",
-                        f"{weight:.3f}",
-                        f"{flow_value:.6f}",
-                        f"{pressure_value:.2f}",
-                        f"{temperature_value:.2f}",
-                        stability
-                    ])
-                    
-                    self.log_file.flush()
-                    self.record_count += 1
-                    self.record_count_var.set(f"Records: {self.record_count}")
-                    
-                    # Update graph data
-                    if self.graph_start_time:
-                        graph_time = time.time() - self.graph_start_time
-                        self.graph_timestamps.append(graph_time)
-                        self.graph_scale_readings.append(weight)
-                        self.graph_flow_readings.append(flow_value)
-        
-        except Exception as e:
-            pass
+        if reading is not None:
+            self.last_scale_reading = reading
+            self.last_scale_stability = 'S' if stable == 1 else 'U'
+            self.current_scale_reading_var.set(f"{reading:.3f} g ({self.last_scale_stability})")
+        else:
+            self.log_message(f"Scale parse failed: {line}")
     
     def update_graph(self, frame):
         """Update the matplotlib graph"""
