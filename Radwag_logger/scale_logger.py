@@ -14,16 +14,28 @@ import matplotlib.dates as mdates
 from matplotlib.ticker import MaxNLocator
 from collections import deque
 
+# Sensirion imports
+from sensirion_shdlc_driver import ShdlcSerialPort, ShdlcConnection
+from sensirion_shdlc_sensorbridge import SensorBridgePort, SensorBridgeShdlcDevice, SensorBridgeI2cProxy
+from sensirion_i2c_driver import I2cConnection, I2cDevice
+from struct import unpack
+
 class ScaleLogger:
     def __init__(self, root):
         self.root = root
-        self.root.title("Radwag Scale Logger")
-        self.root.geometry("1200x800")
+        self.root.title("Radwag Scale + Sensirion Flow Logger")
+        self.root.geometry("1400x900")
         
-        # Serial connection parameters
-        self.com_port = "COM11"
-        self.baud_rate = 9600
-        self.serial_connection = None
+        # Serial connection parameters for scale
+        self.scale_com_port = "COM11"
+        self.scale_baud_rate = 9600
+        self.scale_serial_connection = None
+        
+        # Sensirion sensor bridge parameters
+        self.sensor_bridge_port = "COM3"  # Default, user can change
+        self.sensor_bridge = None
+        self.flow_sensor = None
+        self.flow_connected = False
         
         # Logging variables
         self.is_logging = False
@@ -31,14 +43,17 @@ class ScaleLogger:
         self.csv_writer = None
         self.start_time = None
         
-        # Threading and data queue
-        self.data_queue = queue.Queue()
-        self.read_thread = None
+        # Threading and data queues
+        self.scale_data_queue = queue.Queue()
+        self.flow_data_queue = queue.Queue()
+        self.scale_read_thread = None
+        self.flow_read_thread = None
         self.stop_reading = False
         
         # Graph data storage (keep last 1000 points for better data retention)
         self.graph_timestamps = deque(maxlen=1000)
-        self.graph_readings = deque(maxlen=1000)
+        self.graph_scale_readings = deque(maxlen=1000)
+        self.graph_flow_readings = deque(maxlen=1000)
         self.graph_stability = deque(maxlen=1000)
         self.graph_start_time = None  # For relative time calculation
         
@@ -69,26 +84,41 @@ class ScaleLogger:
         # Connection settings
         settings_frame = ttk.LabelFrame(left_frame, text="Connection Settings", padding="5")
         settings_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        settings_frame.columnconfigure(1, weight=1)
         
-        # Single row with all connection info
-        ttk.Label(settings_frame, text="COM Port:").grid(row=0, column=0, sticky=tk.W)
-        self.com_port_var = tk.StringVar(value=self.com_port)
-        ttk.Entry(settings_frame, textvariable=self.com_port_var, width=10).grid(row=0, column=1, padx=(5, 20))
+        # Scale connection row
+        ttk.Label(settings_frame, text="Scale COM:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.scale_com_port_var = tk.StringVar(value=self.scale_com_port)
+        ttk.Entry(settings_frame, textvariable=self.scale_com_port_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(0, 10))
         
-        ttk.Label(settings_frame, text="Baud Rate:").grid(row=0, column=2, sticky=tk.W)
-        self.baud_rate_var = tk.StringVar(value=str(self.baud_rate))
-        ttk.Entry(settings_frame, textvariable=self.baud_rate_var, width=10).grid(row=0, column=3, padx=(5, 20))
+        ttk.Label(settings_frame, text="Baud:").grid(row=0, column=2, sticky=tk.W)
+        self.scale_baud_rate_var = tk.StringVar(value=str(self.scale_baud_rate))
+        ttk.Entry(settings_frame, textvariable=self.scale_baud_rate_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=(5, 10))
         
-        self.status_var = tk.StringVar(value="Disconnected")
-        status_label = ttk.Label(settings_frame, textvariable=self.status_var, font=('Arial', 10, 'bold'))
-        status_label.grid(row=0, column=4, sticky=tk.W, padx=(5, 0))
+        self.scale_status_var = tk.StringVar(value="Scale: Disconnected")
+        scale_status_label = ttk.Label(settings_frame, textvariable=self.scale_status_var, font=('Arial', 9, 'bold'))
+        scale_status_label.grid(row=0, column=4, sticky=tk.W, padx=(10, 0))
+        
+        # Flow sensor connection row
+        ttk.Label(settings_frame, text="Flow COM:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
+        self.flow_com_port_var = tk.StringVar(value=self.sensor_bridge_port)
+        ttk.Entry(settings_frame, textvariable=self.flow_com_port_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=(0, 10), pady=(5, 0))
+        
+        ttk.Label(settings_frame, text="(SensorBridge)").grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=(5, 0))
+        
+        self.flow_status_var = tk.StringVar(value="Flow: Disconnected")
+        flow_status_label = ttk.Label(settings_frame, textvariable=self.flow_status_var, font=('Arial', 9, 'bold'))
+        flow_status_label.grid(row=1, column=4, sticky=tk.W, padx=(10, 0), pady=(5, 0))
         
         # Control buttons
         button_frame = ttk.Frame(left_frame)
         button_frame.grid(row=1, column=0, pady=(0, 10))
         
-        self.connect_btn = ttk.Button(button_frame, text="Connect", command=self.connect_scale)
-        self.connect_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.connect_scale_btn = ttk.Button(button_frame, text="Connect Scale", command=self.connect_scale)
+        self.connect_scale_btn.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.connect_flow_btn = ttk.Button(button_frame, text="Connect Flow", command=self.connect_flow)
+        self.connect_flow_btn.pack(side=tk.LEFT, padx=(0, 5))
         
         self.start_btn = ttk.Button(button_frame, text="Start Logging", command=self.start_logging, state='disabled')
         self.start_btn.pack(side=tk.LEFT, padx=(0, 5))
@@ -110,10 +140,19 @@ class ScaleLogger:
         current_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         current_frame.columnconfigure(1, weight=1)
         
-        self.current_reading_var = tk.StringVar(value="No data")
-        current_reading_label = ttk.Label(current_frame, textvariable=self.current_reading_var, 
-                                        font=('Arial', 14, 'bold'), foreground='black')
-        current_reading_label.grid(row=0, column=0, sticky=tk.W)
+        # Scale reading
+        ttk.Label(current_frame, text="Scale:", font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.current_scale_reading_var = tk.StringVar(value="No data")
+        scale_reading_label = ttk.Label(current_frame, textvariable=self.current_scale_reading_var, 
+                                        font=('Arial', 12, 'bold'), foreground='blue')
+        scale_reading_label.grid(row=0, column=1, sticky=tk.W)
+        
+        # Flow reading
+        ttk.Label(current_frame, text="Flow:", font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
+        self.current_flow_reading_var = tk.StringVar(value="No data")
+        flow_reading_label = ttk.Label(current_frame, textvariable=self.current_flow_reading_var, 
+                                       font=('Arial', 12, 'bold'), foreground='green')
+        flow_reading_label.grid(row=1, column=1, sticky=tk.W, pady=(5, 0))
         
         # Log display (reduced height for graph)
         self.log_display = scrolledtext.ScrolledText(data_frame, height=10, width=50)
@@ -141,33 +180,40 @@ class ScaleLogger:
         self.graph_frame = right_frame
         
     def setup_graph(self):
-        """Setup the matplotlib graph"""
+        """Setup the matplotlib graph with dual y-axes"""
         # Create figure and subplot
         plt.style.use('default')
-        self.fig, self.ax = plt.subplots(figsize=(8, 6))
+        self.fig, self.ax1 = plt.subplots(figsize=(8, 6))
         self.fig.patch.set_facecolor('white')
         
+        # Create second y-axis for flow
+        self.ax2 = self.ax1.twinx()
+        
         # Configure the plot
-        self.ax.set_xlabel('Time (seconds)')
-        self.ax.set_ylabel('Reading (g)')
-        self.ax.grid(True, alpha=0.3)
+        self.ax1.set_xlabel('Time (seconds)')
+        self.ax1.set_ylabel('Weight (g)', color='blue')
+        self.ax2.set_ylabel('Flow Rate (ml/min)', color='green')
+        self.ax1.grid(True, alpha=0.3)
         
-        # Initialize single line for all readings (no color coding)
-        self.reading_line, = self.ax.plot([], [], 'b-', linewidth=1, label='Weight')
+        # Initialize lines for scale and flow readings
+        self.scale_line, = self.ax1.plot([], [], 'b-', linewidth=1.5, label='Weight')
+        self.flow_line, = self.ax2.plot([], [], 'g-', linewidth=1.5, label='Flow Rate')
         
-        # No legend needed
-        # self.ax.legend(loc='upper right')
+        # Color the y-axis labels
+        self.ax1.tick_params(axis='y', labelcolor='blue')
+        self.ax2.tick_params(axis='y', labelcolor='green')
         
         # Set initial default limits
-        self.ax.set_xlim(0, 60)  # Start with 60 seconds range
-        self.ax.set_ylim(-5, 10)  # Default -5 to 10g range
+        self.ax1.set_xlim(0, 60)  # Start with 60 seconds range
+        self.ax1.set_ylim(-5, 10)  # Default -5 to 10g range for scale
+        self.ax2.set_ylim(0, 100)  # Default 0 to 100 ml/min for flow
         
         # Set initial ticks for default range
         self.set_smart_y_ticks(-5, 10)
         
         # Enable both major and minor grids
-        self.ax.grid(True, which='major', alpha=0.5, linewidth=0.8)
-        self.ax.grid(True, which='minor', alpha=0.3, linewidth=0.5)
+        self.ax1.grid(True, which='major', alpha=0.5, linewidth=0.8)
+        self.ax1.grid(True, which='minor', alpha=0.3, linewidth=0.5)
         
         # Embed plot in tkinter
         self.canvas = FigureCanvasTkAgg(self.fig, self.graph_frame)
@@ -235,11 +281,11 @@ class ScaleLogger:
             self.auto_scale_var.set(False)  # Disable auto scale
             
             # Set exact limits without any padding or adjustment
-            self.ax.set_ylim(y_min, y_max)
+            self.ax1.set_ylim(y_min, y_max)
             self.set_smart_y_ticks(y_min, y_max)
             
             # Force exact limits again after setting ticks (in case matplotlib expanded them)
-            self.ax.set_ylim(y_min, y_max)
+            self.ax1.set_ylim(y_min, y_max)
             
             # Force immediate update without auto-scaling interference
             self.canvas.draw_idle()
@@ -301,7 +347,8 @@ class ScaleLogger:
     def clear_graph(self):
         """Clear the graph data"""
         self.graph_timestamps.clear()
-        self.graph_readings.clear()
+        self.graph_scale_readings.clear()
+        self.graph_flow_readings.clear()
         self.graph_stability.clear()
         self.graph_start_time = None  # Reset start time
         self.update_graph()
@@ -310,8 +357,9 @@ class ScaleLogger:
         """Update the graph with current data"""
         try:
             if len(self.graph_timestamps) == 0:
-                # Clear the line if no data
-                self.reading_line.set_data([], [])
+                # Clear the lines if no data
+                self.scale_line.set_data([], [])
+                self.flow_line.set_data([], [])
             else:
                 # Convert timestamps to relative seconds
                 if self.graph_start_time is None:
@@ -323,8 +371,9 @@ class ScaleLogger:
                     relative_time = (timestamp - self.graph_start_time).total_seconds()
                     relative_times.append(relative_time)
                 
-                # Update single line with all readings
-                self.reading_line.set_data(relative_times, list(self.graph_readings))
+                # Update lines with scale and flow readings
+                self.scale_line.set_data(relative_times, list(self.graph_scale_readings))
+                self.flow_line.set_data(relative_times, list(self.graph_flow_readings))
                 
                 # Update X-axis (time) with smart tick spacing
                 if relative_times:
@@ -335,21 +384,21 @@ class ScaleLogger:
                     time_padding = max(time_max * 0.05, 5)  # At least 5 seconds padding
                     x_max = time_max + time_padding
                     
-                    self.ax.set_xlim(time_min, x_max)
+                    self.ax1.set_xlim(time_min, x_max)
                     
                     # Set smart X-axis ticks based on time range
                     self.set_smart_x_ticks(time_max)
                 
                 # Update Y-axis - ONLY auto-scale if checkbox is checked AND we have data
-                if self.auto_scale_var.get() and len(self.graph_readings) > 0:
-                    y_values = list(self.graph_readings)
+                if self.auto_scale_var.get() and len(self.graph_scale_readings) > 0:
+                    y_values = list(self.graph_scale_readings)
                     data_min = min(y_values)
                     data_max = max(y_values)
                     
                     # Get nice round limits
                     y_min, y_max = self.get_nice_limits(data_min, data_max)
                     
-                    self.ax.set_ylim(y_min, y_max)
+                    self.ax1.set_ylim(y_min, y_max)
                     
                     # Update the manual control fields to show current auto values
                     self.y_min_var.set(str(int(y_min) if y_min == int(y_min) else y_min))
@@ -362,20 +411,32 @@ class ScaleLogger:
                     try:
                         manual_y_min = float(self.y_min_var.get())
                         manual_y_max = float(self.y_max_var.get())
-                        current_ylim = self.ax.get_ylim()
+                        current_ylim = self.ax1.get_ylim()
                         
                         # Only update if the current limits don't match manual settings
                         if abs(current_ylim[0] - manual_y_min) > 0.001 or abs(current_ylim[1] - manual_y_max) > 0.001:
-                            self.ax.set_ylim(manual_y_min, manual_y_max)
+                            self.ax1.set_ylim(manual_y_min, manual_y_max)
                         
                         # Set ticks and then force the limits again (in case ticks expanded them)
                         self.set_smart_y_ticks(manual_y_min, manual_y_max)
-                        self.ax.set_ylim(manual_y_min, manual_y_max)  # Force exact limits after ticks
+                        self.ax1.set_ylim(manual_y_min, manual_y_max)  # Force exact limits after ticks
                         
                     except ValueError:
                         # If manual fields have invalid values, just update ticks for current limits
-                        current_ylim = self.ax.get_ylim()
+                        current_ylim = self.ax1.get_ylim()
                         self.set_smart_y_ticks(current_ylim[0], current_ylim[1])
+                
+                # Auto-scale flow axis
+                if len(self.graph_flow_readings) > 0:
+                    flow_values = [v for v in self.graph_flow_readings if v is not None]
+                    if flow_values:
+                        flow_min = min(flow_values)
+                        flow_max = max(flow_values)
+                        flow_range = flow_max - flow_min
+                        if flow_range < 10:
+                            self.ax2.set_ylim(max(0, flow_min - 5), flow_max + 5)
+                        else:
+                            self.ax2.set_ylim(max(0, flow_min - flow_range * 0.1), flow_max + flow_range * 0.1)
             
             # Redraw the canvas
             self.canvas.draw_idle()
@@ -430,8 +491,8 @@ class ScaleLogger:
                 step = len(major_ticks) // 10 + 1
                 major_ticks = major_ticks[::step]
             
-            self.ax.set_xticks(major_ticks)
-            self.ax.set_xticks(minor_ticks, minor=True)
+            self.ax1.set_xticks(major_ticks)
+            self.ax1.set_xticks(minor_ticks, minor=True)
             
         except Exception as e:
             pass  # Silent error handling for X-tick setting
@@ -487,74 +548,224 @@ class ScaleLogger:
                 step = len(major_ticks) // 15 + 1
                 major_ticks = major_ticks[::step]
             
-            self.ax.set_yticks(major_ticks)
-            self.ax.set_yticks(minor_ticks, minor=True)
+            self.ax1.set_yticks(major_ticks)
+            self.ax1.set_yticks(minor_ticks, minor=True)
             
         except Exception as e:
             pass  # Silent error handling for Y-tick setting
         
     def connect_scale(self):
         try:
-            if self.serial_connection and self.serial_connection.is_open:
+            if self.scale_serial_connection and self.scale_serial_connection.is_open:
                 self.disconnect_scale()
                 return
                 
-            self.com_port = self.com_port_var.get()
-            self.baud_rate = int(self.baud_rate_var.get())
+            self.scale_com_port = self.scale_com_port_var.get()
+            self.scale_baud_rate = int(self.scale_baud_rate_var.get())
             
-            self.serial_connection = serial.Serial(
-                port=self.com_port,
-                baudrate=self.baud_rate,
+            self.scale_serial_connection = serial.Serial(
+                port=self.scale_com_port,
+                baudrate=self.scale_baud_rate,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 timeout=1
             )
             
-            self.status_var.set("Connected")
-            self.connect_btn.config(text="Disconnect")
-            self.start_btn.config(state='normal')
+            self.scale_status_var.set("Scale: Connected")
+            self.connect_scale_btn.config(text="Disconnect Scale")
+            self.update_start_button_state()
             
             # Start reading thread
             self.stop_reading = False
-            self.read_thread = threading.Thread(target=self.read_scale_data)
-            self.read_thread.daemon = True
-            self.read_thread.start()
+            self.scale_read_thread = threading.Thread(target=self.read_scale_data)
+            self.scale_read_thread.daemon = True
+            self.scale_read_thread.start()
             
         except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed to connect to {self.com_port}: {str(e)}")
+            messagebox.showerror("Connection Error", f"Failed to connect to scale {self.scale_com_port}: {str(e)}")
             
     def disconnect_scale(self):
         self.stop_reading = True
-        if self.read_thread:
-            self.read_thread.join(timeout=2)
+        if self.scale_read_thread:
+            self.scale_read_thread.join(timeout=2)
             
-        if self.serial_connection and self.serial_connection.is_open:
-            self.serial_connection.close()
+        if self.scale_serial_connection and self.scale_serial_connection.is_open:
+            self.scale_serial_connection.close()
             
-        self.status_var.set("Disconnected")
-        self.connect_btn.config(text="Connect")
-        self.start_btn.config(state='disabled')
-        self.stop_btn.config(state='disabled')
+        self.scale_status_var.set("Scale: Disconnected")
+        self.connect_scale_btn.config(text="Connect Scale")
+        self.update_start_button_state()
+        
+    def connect_flow(self):
+        """Connect to Sensirion flow sensor via SensorBridge"""
+        try:
+            if self.flow_connected:
+                self.disconnect_flow()
+                return
+            
+            self.sensor_bridge_port = self.flow_com_port_var.get()
+            
+            # Initialize SensorBridge connection
+            try:
+                serial_port = ShdlcSerialPort(port=self.sensor_bridge_port, baudrate=460800)
+                self.sensor_bridge = SensorBridgeShdlcDevice(ShdlcConnection(serial_port), slave_address=0)
+                
+                # Test communication with SensorBridge
+                version = self.sensor_bridge.get_version()
+                print(f"SensorBridge firmware version: {version}")
+                
+            except Exception as e:
+                raise Exception(f"Failed to connect to SensorBridge on {self.sensor_bridge_port}. "
+                              f"Make sure the correct COM port is selected and the device is connected. "
+                              f"Error: {str(e)}")
+            
+            # Switch SensorBridge port to I2C mode
+            try:
+                self.sensor_bridge.set_i2c_frequency(SensorBridgePort.ONE, frequency=100000)
+                self.sensor_bridge.set_supply_voltage(SensorBridgePort.ONE, voltage=3.3)
+                self.sensor_bridge.switch_supply_on(SensorBridgePort.ONE)
+                time.sleep(0.5)  # Give power supply time to stabilize
+            except Exception as e:
+                raise Exception(f"Failed to configure SensorBridge I2C port: {str(e)}")
+            
+            # Create I2C connection
+            i2c_transceiver = SensorBridgeI2cProxy(self.sensor_bridge, port=SensorBridgePort.ONE)
+            i2c_connection = I2cConnection(i2c_transceiver)
+            
+            # Initialize SFM3300 flow sensor (I2C address 0x40)
+            # SFM3300 uses direct I2C commands
+            try:
+                self.flow_sensor = I2cDevice(i2c_connection, slave_address=0x40)
+                
+                # Start continuous measurement for H2O - send command 0x3608
+                self.flow_sensor.write([0x36, 0x08])
+                time.sleep(0.1)  # Give sensor time to start
+                
+                # Try to read a value to verify sensor is responding
+                test_data = self.flow_sensor.read(3)
+                print(f"SFM3300 test read successful: {[hex(b) for b in test_data]}")
+                
+            except Exception as e:
+                raise Exception(f"Failed to communicate with SFM3300 sensor at I2C address 0x40. "
+                              f"Make sure the sensor is properly connected to the SensorBridge. "
+                              f"Error: {str(e)}")
+            
+            self.flow_connected = True
+            self.flow_status_var.set("Flow: Connected")
+            self.connect_flow_btn.config(text="Disconnect Flow")
+            self.update_start_button_state()
+            
+            # Start reading thread
+            self.flow_read_thread = threading.Thread(target=self.read_flow_data)
+            self.flow_read_thread.daemon = True
+            self.flow_read_thread.start()
+            
+            messagebox.showinfo("Success", f"Successfully connected to SFM3300 flow sensor!\nSensorBridge: {version}")
+            
+        except Exception as e:
+            messagebox.showerror("Connection Error", f"Failed to connect to flow sensor: {str(e)}")
+            self.flow_connected = False
+            # Cleanup on failure
+            try:
+                if self.sensor_bridge:
+                    self.sensor_bridge.switch_supply_off(SensorBridgePort.ONE)
+            except:
+                pass
+            
+    def disconnect_flow(self):
+        """Disconnect from flow sensor"""
+        self.stop_reading = True
+        
+        if self.flow_read_thread:
+            self.flow_read_thread.join(timeout=2)
+        
+        try:
+            if self.flow_sensor:
+                # Stop continuous measurement - send command 0x3FF9
+                self.flow_sensor.write([0x3F, 0xF9])
+        except:
+            pass
+            
+        try:
+            if self.sensor_bridge:
+                self.sensor_bridge.switch_supply_off(SensorBridgePort.ONE)
+        except:
+            pass
+            
+        self.flow_connected = False
+        self.flow_sensor = None
+        self.sensor_bridge = None
+        self.flow_status_var.set("Flow: Disconnected")
+        self.connect_flow_btn.config(text="Connect Flow")
+        self.update_start_button_state()
+        
+    def update_start_button_state(self):
+        """Enable start button if at least one sensor is connected"""
+        if (self.scale_serial_connection and self.scale_serial_connection.is_open) or self.flow_connected:
+            self.start_btn.config(state='normal')
+        else:
+            self.start_btn.config(state='disabled')
+            self.stop_btn.config(state='disabled')
         
     def read_scale_data(self):
-        while not self.stop_reading and self.serial_connection and self.serial_connection.is_open:
+        while not self.stop_reading and self.scale_serial_connection and self.scale_serial_connection.is_open:
             try:
-                if self.serial_connection.in_waiting > 0:
-                    data = self.serial_connection.readline().decode('utf-8').strip()
+                if self.scale_serial_connection.in_waiting > 0:
+                    data = self.scale_serial_connection.readline().decode('utf-8').strip()
                     if data:
                         timestamp = datetime.datetime.now()
-                        self.data_queue.put((timestamp, data))
+                        self.scale_data_queue.put((timestamp, data))
                 time.sleep(0.1)
             except Exception as e:
                 pass  # Silent error handling for data reading
                 break
                 
+    def read_flow_data(self):
+        """Read data from Sensirion SFM3300 flow sensor"""
+        while not self.stop_reading and self.flow_connected and self.flow_sensor:
+            try:
+                # Read 3 bytes from SFM3300 (flow value as signed 16-bit + CRC)
+                data = self.flow_sensor.read(3)
+                
+                # Extract flow value (first 2 bytes, big-endian signed int)
+                flow_raw = unpack('>h', bytes(data[0:2]))[0]
+                
+                # Convert to flow rate using SFM3300 calibration
+                # For SFM3300-AW: Flow (slm) = (RawValue - Offset) / ScaleFactor
+                # Typical values: Offset = 32000, ScaleFactor = 120
+                offset = 32000
+                scale_factor = 120.0
+                flow_slm = (flow_raw - offset) / scale_factor
+                
+                # Convert slm (standard liters per minute) to ml/min
+                flow_ml_min = flow_slm * 1000.0
+                
+                # SFM3300 doesn't provide temperature in the same read, use 25°C as default
+                temperature = 25.0
+                
+                timestamp = datetime.datetime.now()
+                self.flow_data_queue.put((timestamp, flow_ml_min, temperature))
+                
+                time.sleep(0.1)  # Read at ~10 Hz
+            except Exception as e:
+                pass  # Silent error handling
+                break
+                
     def check_data_queue(self):
+        # Check scale data queue
         try:
             while True:
-                timestamp, data = self.data_queue.get_nowait()
+                timestamp, data = self.scale_data_queue.get_nowait()
                 self.process_scale_data(timestamp, data)
+        except queue.Empty:
+            pass
+        
+        # Check flow data queue
+        try:
+            while True:
+                timestamp, flow_ml_min, temperature = self.flow_data_queue.get_nowait()
+                self.process_flow_data(timestamp, flow_ml_min, temperature)
         except queue.Empty:
             pass
         
@@ -594,6 +805,9 @@ class ScaleLogger:
         # Parse the scale data
         stable, reading = self.parse_scale_data(data)
         
+        # Get current flow reading for synced logging
+        current_flow = self.graph_flow_readings[-1] if len(self.graph_flow_readings) > 0 else None
+        
         # Add to graph data if parsing successful
         if stable is not None and reading is not None:
             # Set start time on first data point
@@ -601,24 +815,26 @@ class ScaleLogger:
                 self.graph_start_time = timestamp
                 
             self.graph_timestamps.append(timestamp)
-            self.graph_readings.append(reading)
+            self.graph_scale_readings.append(reading)
+            self.graph_flow_readings.append(current_flow)  # Add current flow value
             self.graph_stability.append(stable == 1)
         
         # Update current reading display
         if stable is not None and reading is not None:
             stability_text = "Stable" if stable else "Unstable"
             display_text = f"{reading:.2f} g ({stability_text})"
-            self.current_reading_var.set(display_text)
+            self.current_scale_reading_var.set(display_text)
         else:
-            self.current_reading_var.set(data)  # Show raw data if parsing fails
+            self.current_scale_reading_var.set(data)  # Show raw data if parsing fails
         
         # Add to log display
         formatted_time = timestamp.strftime("%H:%M:%S.%f")[:-3]  # Include milliseconds
         if stable is not None and reading is not None:
             stability_text = "S" if stable else "U"
-            log_entry = f"[{formatted_time}] {reading:.2f} g [{stability_text}]\n"
+            flow_text = f", Flow: {current_flow:.1f} ml/min" if current_flow is not None else ""
+            log_entry = f"[{formatted_time}] Scale: {reading:.2f} g [{stability_text}]{flow_text}\n"
         else:
-            log_entry = f"[{formatted_time}] {data} [RAW]\n"
+            log_entry = f"[{formatted_time}] Scale: {data} [RAW]\n"
         
         self.log_display.insert(tk.END, log_entry)
         self.log_display.see(tk.END)
@@ -633,25 +849,79 @@ class ScaleLogger:
             if stable is not None and reading is not None:
                 self.csv_writer.writerow([
                     timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    "scale",
                     stable,
-                    reading
+                    reading,
+                    current_flow if current_flow is not None else ""
                 ])
             else:
                 # Fallback for unparseable data
                 self.csv_writer.writerow([
                     timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    "scale",
                     "ERROR",
-                    data
+                    data,
+                    ""
                 ])
             self.log_file.flush()  # Ensure data is written immediately
             
             # Update record count
             current_count = int(self.record_count_var.get().split(": ")[1])
             self.record_count_var.set(f"Records: {current_count + 1}")
+    
+    def process_flow_data(self, timestamp, flow_ml_min, temperature):
+        """Process flow sensor data"""
+        # Get current scale reading for synced logging
+        current_scale = self.graph_scale_readings[-1] if len(self.graph_scale_readings) > 0 else None
+        
+        # Add to graph data
+        if self.graph_start_time is None:
+            self.graph_start_time = timestamp
+            
+        self.graph_timestamps.append(timestamp)
+        self.graph_scale_readings.append(current_scale)  # Add current scale value
+        self.graph_flow_readings.append(flow_ml_min)
+        self.graph_stability.append(True)  # Flow sensor is always "stable"
+        
+        # Update current reading display
+        display_text = f"{flow_ml_min:.1f} ml/min ({temperature:.1f} °C)"
+        self.current_flow_reading_var.set(display_text)
+        
+        # Add to log display
+        formatted_time = timestamp.strftime("%H:%M:%S.%f")[:-3]
+        scale_text = f", Scale: {current_scale:.2f} g" if current_scale is not None else ""
+        log_entry = f"[{formatted_time}] Flow: {flow_ml_min:.1f} ml/min{scale_text}\n"
+        
+        self.log_display.insert(tk.END, log_entry)
+        self.log_display.see(tk.END)
+        
+        # Limit log display to last 1000 lines
+        lines = self.log_display.get("1.0", tk.END).split("\n")
+        if len(lines) > 1000:
+            self.log_display.delete("1.0", f"{len(lines)-1000}.0")
+        
+        # Write to CSV if logging
+        if self.is_logging and self.csv_writer:
+            self.csv_writer.writerow([
+                timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "flow",
+                "1",  # Flow is always stable
+                flow_ml_min,
+                current_scale if current_scale is not None else ""
+            ])
+            self.log_file.flush()
+            
+            # Update record count
+            current_count = int(self.record_count_var.get().split(": ")[1])
+            self.record_count_var.set(f"Records: {current_count + 1}")
             
     def start_logging(self):
-        if not self.serial_connection or not self.serial_connection.is_open:
-            messagebox.showerror("Error", "Please connect to the scale first")
+        # Check if at least one sensor is connected
+        has_scale = self.scale_serial_connection and self.scale_serial_connection.is_open
+        has_flow = self.flow_connected
+        
+        if not has_scale and not has_flow:
+            messagebox.showerror("Error", "Please connect at least one sensor first")
             return
             
         try:
@@ -662,7 +932,7 @@ class ScaleLogger:
             
             # Create filename with start time
             self.start_time = datetime.datetime.now()
-            filename = self.start_time.strftime("scale_log_%Y%m%d_%H%M%S.csv")
+            filename = self.start_time.strftime("combined_log_%Y%m%d_%H%M%S.csv")
             filepath = os.path.join(data_folder, filename)
             
             # Create CSV file
@@ -670,7 +940,7 @@ class ScaleLogger:
             self.csv_writer = csv.writer(self.log_file)
             
             # Write header
-            self.csv_writer.writerow(['Timestamp', 'Stable', 'Reading'])
+            self.csv_writer.writerow(['Timestamp', 'Source', 'Stable', 'Value', 'Secondary'])
             
             self.is_logging = True
             self.start_btn.config(state='disabled')
@@ -707,7 +977,8 @@ class ScaleLogger:
     def reset_logging(self):
         self.stop_logging()
         self.log_display.delete('1.0', tk.END)
-        self.current_reading_var.set("No data")
+        self.current_scale_reading_var.set("No data")
+        self.current_flow_reading_var.set("No data")
         self.log_info_var.set("No active log file")
         self.record_count_var.set("Records: 0")
         self.clear_graph()
@@ -718,6 +989,7 @@ class ScaleLogger:
     def on_closing(self):
         self.stop_logging()
         self.disconnect_scale()
+        self.disconnect_flow()
         self.root.destroy()
 
 def main():
